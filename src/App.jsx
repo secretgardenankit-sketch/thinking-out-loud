@@ -7,12 +7,17 @@ export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [subtitles, setSubtitles] = useState("");
   const [finalSubtitles, setFinalSubtitles] = useState([]);
-  const [sourceLang, setSourceLang] = useState("hi");
   const [recordings, setRecordings] = useState([]);
   const [editItem, setEditItem] = useState(null);
   const [elapsed, setElapsed] = useState(0);
   const [translating, setTranslating] = useState(false);
   const [exportMsg, setExportMsg] = useState("");
+
+  // Audio processing states
+  const [gain, setGain] = useState(0);
+  const [eqOn, setEqOn] = useState(false);
+  const [noiseOn, setNoiseOn] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
 
   const canvasRef = useRef(null);
   const animFrameRef = useRef(null);
@@ -26,6 +31,16 @@ export default function App() {
   const streamRef = useRef(null);
   const volumeRef = useRef(0);
 
+  // Edit screen audio nodes
+  const editAudioCtxRef = useRef(null);
+  const editSourceRef = useRef(null);
+  const editGainRef = useRef(null);
+  const editHighPassRef = useRef(null);
+  const editEQRef = useRef(null);
+  const editAnalyserRef = useRef(null);
+  const editAudioElRef = useRef(null);
+
+  // ─── VISUALIZER ───────────────────────────────────────────────────────────
   const drawWaveform = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas || !analyserRef.current) return;
@@ -36,7 +51,8 @@ export default function App() {
     let sum = 0;
     for (let i = 0; i < dataArray.length; i++) sum += Math.abs(dataArray[i] - 128);
     const rawVolume = sum / dataArray.length;
-    volumeRef.current = volumeRef.current * 0.85 + rawVolume * 0.15;
+    // Fast response — minimal smoothing
+    volumeRef.current = volumeRef.current * 0.4 + rawVolume * 0.6;
     const vol = volumeRef.current;
 
     ctx.clearRect(0, 0, W, H);
@@ -48,17 +64,15 @@ export default function App() {
 
     const centerX = W / 2;
     const centerY = H / 2;
-    const triWidth = Math.max(10, Math.min(vol * 12, W * 0.25));
-    const triHeight = Math.max(2, Math.min(vol * 6, H * 0.38));
-    const flatLeft = centerX - triWidth;
-    const flatRight = centerX + triWidth;
+    const triWidth = Math.max(8, Math.min(vol * 10, W * 0.22));
+    const triHeight = Math.max(1, Math.min(vol * 7, H * 0.40));
 
     ctx.moveTo(0, centerY);
-    ctx.lineTo(flatLeft, centerY);
-    ctx.lineTo(flatLeft + triWidth * 0.5, centerY - triHeight);
+    ctx.lineTo(centerX - triWidth, centerY);
+    ctx.lineTo(centerX - triWidth * 0.5, centerY - triHeight);
     ctx.lineTo(centerX, centerY);
     ctx.lineTo(centerX + triWidth * 0.5, centerY + triHeight);
-    ctx.lineTo(flatRight, centerY);
+    ctx.lineTo(centerX + triWidth, centerY);
     ctx.lineTo(W, centerY);
     ctx.stroke();
 
@@ -94,6 +108,84 @@ export default function App() {
     }
   }, [screen, drawIdle]);
 
+  // ─── EDIT AUDIO SETUP ─────────────────────────────────────────────────────
+  const setupEditAudio = useCallback(() => {
+    if (!editAudioElRef.current || !editItem) return;
+    if (editAudioCtxRef.current) {
+      editAudioCtxRef.current.close();
+    }
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    editAudioCtxRef.current = ctx;
+
+    const source = ctx.createMediaElementSource(editAudioElRef.current);
+    editSourceRef.current = source;
+
+    // High-pass filter — 300Hz noise cut
+    const highPass = ctx.createBiquadFilter();
+    highPass.type = "highpass";
+    highPass.frequency.value = noiseOn ? 300 : 20;
+    highPass.Q.value = 0.7;
+    editHighPassRef.current = highPass;
+
+    // EQ — boost voice 1kHz–4kHz
+    const eq = ctx.createBiquadFilter();
+    eq.type = "peaking";
+    eq.frequency.value = 2000;
+    eq.gain.value = eqOn ? 6 : 0;
+    eq.Q.value = 1.0;
+    editEQRef.current = eq;
+
+    // Gain node
+    const gainNode = ctx.createGain();
+    gainNode.gain.value = Math.pow(10, gain / 20);
+    editGainRef.current = gainNode;
+
+    // Analyser for edit preview visualizer (future use)
+    const analyser = ctx.createAnalyser();
+    editAnalyserRef.current = analyser;
+
+    // Chain: source → highpass → eq → gain → analyser → output
+    source.connect(highPass);
+    highPass.connect(eq);
+    eq.connect(gainNode);
+    gainNode.connect(analyser);
+    analyser.connect(ctx.destination);
+  }, [editItem, gain, noiseOn, eqOn]);
+
+  useEffect(() => {
+    if (screen === "edit" && editItem) {
+      setTimeout(() => {
+        if (editAudioElRef.current) setupEditAudio();
+      }, 300);
+    }
+    return () => {
+      if (editAudioCtxRef.current) {
+        editAudioCtxRef.current.close();
+        editAudioCtxRef.current = null;
+      }
+    };
+  }, [screen, editItem]);
+
+  // Update audio nodes live when toggles/slider change
+  useEffect(() => {
+    if (editHighPassRef.current) {
+      editHighPassRef.current.frequency.value = noiseOn ? 300 : 20;
+    }
+  }, [noiseOn]);
+
+  useEffect(() => {
+    if (editEQRef.current) {
+      editEQRef.current.gain.value = eqOn ? 6 : 0;
+    }
+  }, [eqOn]);
+
+  useEffect(() => {
+    if (editGainRef.current) {
+      editGainRef.current.gain.value = Math.pow(10, gain / 20);
+    }
+  }, [gain]);
+
+  // ─── RECORDING ────────────────────────────────────────────────────────────
   const getSupportedMimeType = () => {
     const types = ["audio/mp4", "audio/aac", "audio/webm;codecs=opus", "audio/webm"];
     for (const type of types) {
@@ -108,7 +200,8 @@ export default function App() {
       streamRef.current = stream;
       audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
       analyserRef.current = audioContextRef.current.createAnalyser();
-      analyserRef.current.fftSize = 1024;
+      analyserRef.current.fftSize = 512;
+      analyserRef.current.smoothingTimeConstant = 0.3;
       const source = audioContextRef.current.createMediaStreamSource(stream);
       source.connect(analyserRef.current);
 
@@ -123,7 +216,7 @@ export default function App() {
         recognitionRef.current = new SpeechRecognition();
         recognitionRef.current.continuous = true;
         recognitionRef.current.interimResults = true;
-        recognitionRef.current.lang = SPEECH_LANG_MAP[sourceLang];
+        recognitionRef.current.lang = SPEECH_LANG_MAP["hi"];
         recognitionRef.current.onresult = (e) => {
           let interim = "", final = "";
           for (let i = e.resultIndex; i < e.results.length; i++) {
@@ -161,11 +254,13 @@ export default function App() {
           transcript: allText,
           date: new Date().toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }),
           time: new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }),
-          sourceLang: "hi",
           translation: "",
         };
         setRecordings(prev => [rec, ...prev]);
         setEditItem(rec);
+        setGain(0);
+        setEqOn(false);
+        setNoiseOn(false);
         setScreen("edit");
       };
       mediaRecorderRef.current.stop();
@@ -182,10 +277,101 @@ export default function App() {
     volumeRef.current = 0;
   };
 
+  // ─── EXPORT WITH PROCESSING ───────────────────────────────────────────────
+  const handleExport = async () => {
+    if (!editItem?.blob) return;
+    setExportMsg("Processing audio...");
+
+    try {
+      const offlineCtx = new OfflineAudioContext(1, 44100 * editItem.duration || 44100 * 60, 44100);
+      const arrayBuffer = await editItem.blob.arrayBuffer();
+      const audioBuffer = await offlineCtx.decodeAudioData(arrayBuffer);
+
+      const source = offlineCtx.createBufferSource();
+      source.buffer = audioBuffer;
+
+      const highPass = offlineCtx.createBiquadFilter();
+      highPass.type = "highpass";
+      highPass.frequency.value = noiseOn ? 300 : 20;
+      highPass.Q.value = 0.7;
+
+      const eq = offlineCtx.createBiquadFilter();
+      eq.type = "peaking";
+      eq.frequency.value = 2000;
+      eq.gain.value = eqOn ? 6 : 0;
+      eq.Q.value = 1.0;
+
+      const gainNode = offlineCtx.createGain();
+      gainNode.gain.value = Math.pow(10, gain / 20);
+
+      source.connect(highPass);
+      highPass.connect(eq);
+      eq.connect(gainNode);
+      gainNode.connect(offlineCtx.destination);
+      source.start();
+
+      const rendered = await offlineCtx.startRendering();
+
+      // Convert to WAV
+      const wavBuffer = audioBufferToWav(rendered);
+      const wavBlob = new Blob([wavBuffer], { type: "audio/wav" });
+      const url = URL.createObjectURL(wavBlob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `thinking-out-loud-${editItem.date}.wav`.replace(/\s/g, "-");
+      a.click();
+      setExportMsg("Saved! Open in Files app → tap Share → Save to Photos.");
+    } catch {
+      // Fallback — export original
+      const a = document.createElement("a");
+      a.href = editItem.url;
+      a.download = `thinking-out-loud-${editItem.date}.${editItem.ext || "m4a"}`.replace(/\s/g, "-");
+      a.click();
+      setExportMsg("Saved to Files app.");
+    }
+    setTimeout(() => setExportMsg(""), 5000);
+  };
+
+  // WAV encoder
+  const audioBufferToWav = (buffer) => {
+    const numChannels = buffer.numberOfChannels;
+    const sampleRate = buffer.sampleRate;
+    const format = 1;
+    const bitDepth = 16;
+    const bytesPerSample = bitDepth / 8;
+    const blockAlign = numChannels * bytesPerSample;
+    const byteRate = sampleRate * blockAlign;
+    const dataSize = buffer.length * blockAlign;
+    const arrayBuffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(arrayBuffer);
+    const writeString = (offset, str) => { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); };
+    writeString(0, "RIFF");
+    view.setUint32(4, 36 + dataSize, true);
+    writeString(8, "WAVE");
+    writeString(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, format, true);
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, byteRate, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, bitDepth, true);
+    writeString(36, "data");
+    view.setUint32(40, dataSize, true);
+    let offset = 44;
+    for (let i = 0; i < buffer.length; i++) {
+      for (let ch = 0; ch < numChannels; ch++) {
+        const sample = Math.max(-1, Math.min(1, buffer.getChannelData(ch)[i]));
+        view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+        offset += 2;
+      }
+    }
+    return arrayBuffer;
+  };
+
   const handleTranslate = async (targetLang) => {
     if (!editItem?.transcript) return;
-    const fromLabel = editItem.sourceLang === "hi" ? "Hindi" : "English";
-    const toLabel = targetLang === "hi" ? "Hindi" : "English";
+    const fromLabel = "Hindi", toLabel = targetLang === "en" ? "English" : "Hindi";
     setTranslating(true);
     try {
       const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -200,47 +386,41 @@ export default function App() {
       const data = await response.json();
       const result = data.content?.[0]?.text || "";
       setEditItem(prev => ({ ...prev, translation: result, targetLang }));
-      setRecordings(prev => prev.map(r => r.id === editItem.id ? { ...r, translation: result, targetLang } : r));
+      setRecordings(prev => prev.map(r => r.id === editItem.id ? { ...r, translation: result } : r));
     } catch {
       alert("Translation failed. Please try again.");
     }
     setTranslating(false);
   };
 
-  const handleExport = () => {
-    if (!editItem?.blob) return;
-    const a = document.createElement("a");
-    a.href = editItem.url;
-    a.download = `thinking-out-loud-${editItem.date}.${editItem.ext || "m4a"}`.replace(/\s/g, "-");
-    a.click();
-    setExportMsg("Saved! Open in Files app → tap Share → Save to Photos.");
-    setTimeout(() => setExportMsg(""), 5000);
-  };
-
   const formatTime = (s) => `${Math.floor(s / 60).toString().padStart(2, "0")}:${(s % 60).toString().padStart(2, "0")}`;
 
-  // ─── HOME ──────────────────────────────────────────────────────────────────
+  const Toggle = ({ on, onToggle, label, sub }) => (
+    <div onClick={onToggle} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 16px", background: "#111", borderRadius: 10, border: `1px solid ${on ? "rgba(255,255,255,0.3)" : "rgba(255,255,255,0.08)"}`, cursor: "pointer", transition: "border 0.2s" }}>
+      <div>
+        <div style={{ fontSize: 14, color: on ? "#fff" : "rgba(255,255,255,0.6)" }}>{label}</div>
+        {sub && <div style={{ fontSize: 11, color: "rgba(255,255,255,0.3)", marginTop: 2 }}>{sub}</div>}
+      </div>
+      <div style={{ width: 44, height: 24, borderRadius: 12, background: on ? "#fff" : "rgba(255,255,255,0.15)", position: "relative", transition: "background 0.2s", flexShrink: 0 }}>
+        <div style={{ position: "absolute", top: 3, left: on ? 23 : 3, width: 18, height: 18, borderRadius: "50%", background: on ? "#000" : "rgba(255,255,255,0.6)", transition: "left 0.2s" }} />
+      </div>
+    </div>
+  );
+
+  // ─── HOME ─────────────────────────────────────────────────────────────────
   if (screen === "home") return (
     <div style={{ background: "#000", minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", fontFamily: "'Georgia', serif", color: "#fff", padding: "40px 28px", gap: 40 }}>
       <div style={{ textAlign: "center" }}>
         <div style={{ fontSize: 11, letterSpacing: "0.35em", color: "rgba(255,255,255,0.35)", textTransform: "uppercase", marginBottom: 16 }}>Voice Journal</div>
-        <div style={{ fontSize: 44, fontWeight: 300, letterSpacing: "-0.02em", lineHeight: 1.15 }}>
-          Thinking<br /><span style={{ fontStyle: "italic" }}>Out Loud</span>
-        </div>
+        <div style={{ fontSize: 44, fontWeight: 300, letterSpacing: "-0.02em", lineHeight: 1.15 }}>Thinking<br /><span style={{ fontStyle: "italic" }}>Out Loud</span></div>
       </div>
-
       <svg width="100%" height="40" style={{ maxWidth: 300 }} viewBox="0 0 300 40">
         <line x1="0" y1="20" x2="300" y2="20" stroke="rgba(255,255,255,0.3)" strokeWidth="1.5" />
       </svg>
-
       <div style={{ display: "flex", flexDirection: "column", gap: 12, width: "100%", maxWidth: 300 }}>
-        <button onClick={() => setScreen("recording")} style={{ background: "#fff", color: "#000", border: "none", borderRadius: 50, padding: "18px 0", fontSize: 16, fontFamily: "'Georgia', serif", fontStyle: "italic", cursor: "pointer" }}>
-          Start Recording
-        </button>
+        <button onClick={() => setScreen("recording")} style={{ background: "#fff", color: "#000", border: "none", borderRadius: 50, padding: "18px 0", fontSize: 16, fontFamily: "'Georgia', serif", fontStyle: "italic", cursor: "pointer" }}>Start Recording</button>
         {recordings.length > 0 && (
-          <button onClick={() => setScreen("library")} style={{ background: "transparent", color: "rgba(255,255,255,0.45)", border: "1px solid rgba(255,255,255,0.12)", borderRadius: 50, padding: "14px 0", fontSize: 14, fontFamily: "inherit", cursor: "pointer" }}>
-            Library ({recordings.length})
-          </button>
+          <button onClick={() => setScreen("library")} style={{ background: "transparent", color: "rgba(255,255,255,0.45)", border: "1px solid rgba(255,255,255,0.12)", borderRadius: 50, padding: "14px 0", fontSize: 14, fontFamily: "inherit", cursor: "pointer" }}>Library ({recordings.length})</button>
         )}
       </div>
     </div>
@@ -261,7 +441,6 @@ export default function App() {
         )}
         <div style={{ width: 32 }} />
       </div>
-
       <div style={{ flex: 1, position: "relative" }}>
         <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block" }} />
         {(subtitles || finalSubtitles.length > 0) && (
@@ -274,7 +453,6 @@ export default function App() {
           </div>
         )}
       </div>
-
       <div style={{ padding: "24px 0 44px", display: "flex", justifyContent: "center" }}>
         {!isRecording ? (
           <button onClick={startRecording} style={{ width: 72, height: 72, borderRadius: "50%", background: "#fff", border: "none", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -302,21 +480,52 @@ export default function App() {
       </div>
 
       <div style={{ flex: 1, padding: "24px", display: "flex", flexDirection: "column", gap: 24, overflowY: "auto" }}>
-        <audio controls src={editItem.url} style={{ width: "100%", filter: "invert(1)", borderRadius: 8 }} />
+
+        {/* Audio player — processed live */}
+        <audio
+          ref={editAudioElRef}
+          src={editItem.url}
+          controls
+          onPlay={() => {
+            if (editAudioCtxRef.current?.state === "suspended") editAudioCtxRef.current.resume();
+          }}
+          style={{ width: "100%", filter: "invert(1)", borderRadius: 8 }}
+        />
+
+        {/* Gain */}
+        <div>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
+            <div style={{ fontSize: 11, letterSpacing: "0.2em", color: "rgba(255,255,255,0.35)", textTransform: "uppercase" }}>Volume Gain</div>
+            <div style={{ fontSize: 12, color: gain > 0 ? "#fff" : gain < 0 ? "rgba(255,255,255,0.4)" : "rgba(255,255,255,0.3)" }}>{gain > 0 ? `+${gain}` : gain} dB</div>
+          </div>
+          <input type="range" min="-10" max="10" step="1" value={gain} onChange={e => setGain(Number(e.target.value))}
+            style={{ width: "100%", accentColor: "#fff", cursor: "pointer" }} />
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "rgba(255,255,255,0.2)", marginTop: 4 }}>
+            <span>-10</span><span>0</span><span>+10</span>
+          </div>
+        </div>
+
+        {/* EQ + Noise toggles */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <Toggle on={eqOn} onToggle={() => setEqOn(p => !p)} label="Voice Clarity" sub="Boost 1kHz–4kHz voice range" />
+          <Toggle on={noiseOn} onToggle={() => setNoiseOn(p => !p)} label="Noise Filter" sub="Cut wind & rumble below 300Hz" />
+        </div>
 
         {/* Transcript */}
         <div>
           <div style={{ fontSize: 11, letterSpacing: "0.2em", color: "rgba(255,255,255,0.35)", textTransform: "uppercase", marginBottom: 10 }}>Transcript</div>
-          <textarea value={editItem.transcript} onChange={e => setEditItem(prev => ({ ...prev, transcript: e.target.value }))} style={{ width: "100%", minHeight: 120, background: "#111", border: "1px solid rgba(255,255,255,0.1)", color: "#fff", padding: 16, borderRadius: 8, fontSize: 15, fontFamily: "inherit", lineHeight: 1.6, resize: "vertical", boxSizing: "border-box" }} />
+          <textarea value={editItem.transcript} onChange={e => setEditItem(prev => ({ ...prev, transcript: e.target.value }))}
+            style={{ width: "100%", minHeight: 100, background: "#111", border: "1px solid rgba(255,255,255,0.1)", color: "#fff", padding: 16, borderRadius: 8, fontSize: 15, fontFamily: "inherit", lineHeight: 1.6, resize: "vertical", boxSizing: "border-box" }} />
         </div>
 
-        {/* Language + Translate */}
+        {/* Translate */}
         <div>
           <div style={{ fontSize: 11, letterSpacing: "0.2em", color: "rgba(255,255,255,0.35)", textTransform: "uppercase", marginBottom: 12 }}>Translate</div>
           <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
-            {["hi", "en"].map(lang => (
-              <button key={lang} onClick={() => handleTranslate(lang === "hi" ? "en" : "hi")} disabled={translating} style={{ flex: 1, padding: "12px 0", borderRadius: 8, border: "1px solid rgba(255,255,255,0.15)", background: "transparent", color: translating ? "rgba(255,255,255,0.3)" : "rgba(255,255,255,0.7)", fontSize: 13, fontFamily: "inherit", cursor: "pointer" }}>
-                {lang === "hi" ? "→ English" : "→ Hindi"}
+            {["en", "hi"].map(lang => (
+              <button key={lang} onClick={() => handleTranslate(lang)} disabled={translating}
+                style={{ flex: 1, padding: "12px 0", borderRadius: 8, border: "1px solid rgba(255,255,255,0.15)", background: "transparent", color: translating ? "rgba(255,255,255,0.3)" : "rgba(255,255,255,0.7)", fontSize: 13, fontFamily: "inherit", cursor: "pointer" }}>
+                {lang === "en" ? "→ English" : "→ Hindi"}
               </button>
             ))}
           </div>
@@ -346,7 +555,8 @@ export default function App() {
       <div style={{ padding: "8px 24px" }}>
         {recordings.length === 0 && <div style={{ textAlign: "center", color: "rgba(255,255,255,0.25)", padding: "60px 0", fontSize: 15, fontStyle: "italic" }}>No recordings yet</div>}
         {recordings.map(rec => (
-          <div key={rec.id} onClick={() => { setEditItem(rec); setScreen("edit"); }} style={{ padding: "18px 0", borderBottom: "1px solid rgba(255,255,255,0.07)", cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div key={rec.id} onClick={() => { setEditItem(rec); setGain(0); setEqOn(false); setNoiseOn(false); setScreen("edit"); }}
+            style={{ padding: "18px 0", borderBottom: "1px solid rgba(255,255,255,0.07)", cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontSize: 16, marginBottom: 3, fontStyle: "italic" }}>{rec.date}</div>
               <div style={{ fontSize: 12, color: "rgba(255,255,255,0.35)" }}>{rec.time} · {formatTime(rec.duration)}</div>

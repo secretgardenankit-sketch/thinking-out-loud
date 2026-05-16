@@ -12,12 +12,10 @@ export default function App() {
   const [elapsed, setElapsed] = useState(0);
   const [translating, setTranslating] = useState(false);
   const [exportMsg, setExportMsg] = useState("");
-
-  // Audio processing states
   const [gain, setGain] = useState(0);
   const [eqOn, setEqOn] = useState(false);
   const [noiseOn, setNoiseOn] = useState(false);
-  const [isPlaying, setIsPlaying] = useState(false);
+  const [noiseFreq, setNoiseFreq] = useState(100);
 
   const canvasRef = useRef(null);
   const animFrameRef = useRef(null);
@@ -30,17 +28,12 @@ export default function App() {
   const startTimeRef = useRef(null);
   const streamRef = useRef(null);
   const volumeRef = useRef(0);
-
-  // Edit screen audio nodes
   const editAudioCtxRef = useRef(null);
-  const editSourceRef = useRef(null);
-  const editGainRef = useRef(null);
   const editHighPassRef = useRef(null);
   const editEQRef = useRef(null);
-  const editAnalyserRef = useRef(null);
+  const editGainRef = useRef(null);
   const editAudioElRef = useRef(null);
 
-  // ─── VISUALIZER ───────────────────────────────────────────────────────────
   const drawWaveform = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas || !analyserRef.current) return;
@@ -51,7 +44,6 @@ export default function App() {
     let sum = 0;
     for (let i = 0; i < dataArray.length; i++) sum += Math.abs(dataArray[i] - 128);
     const rawVolume = sum / dataArray.length;
-    // Fast response — minimal smoothing
     volumeRef.current = volumeRef.current * 0.4 + rawVolume * 0.6;
     const vol = volumeRef.current;
 
@@ -108,26 +100,21 @@ export default function App() {
     }
   }, [screen, drawIdle]);
 
-  // ─── EDIT AUDIO SETUP ─────────────────────────────────────────────────────
   const setupEditAudio = useCallback(() => {
     if (!editAudioElRef.current || !editItem) return;
-    if (editAudioCtxRef.current) {
-      editAudioCtxRef.current.close();
-    }
+    if (editAudioCtxRef.current) editAudioCtxRef.current.close();
+
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     editAudioCtxRef.current = ctx;
 
     const source = ctx.createMediaElementSource(editAudioElRef.current);
-    editSourceRef.current = source;
 
-    // High-pass filter — 300Hz noise cut
     const highPass = ctx.createBiquadFilter();
     highPass.type = "highpass";
-    highPass.frequency.value = noiseOn ? 300 : 20;
+    highPass.frequency.value = noiseOn ? noiseFreq : 20;
     highPass.Q.value = 0.7;
     editHighPassRef.current = highPass;
 
-    // EQ — boost voice 1kHz–4kHz
     const eq = ctx.createBiquadFilter();
     eq.type = "peaking";
     eq.frequency.value = 2000;
@@ -135,22 +122,15 @@ export default function App() {
     eq.Q.value = 1.0;
     editEQRef.current = eq;
 
-    // Gain node
     const gainNode = ctx.createGain();
     gainNode.gain.value = Math.pow(10, gain / 20);
     editGainRef.current = gainNode;
 
-    // Analyser for edit preview visualizer (future use)
-    const analyser = ctx.createAnalyser();
-    editAnalyserRef.current = analyser;
-
-    // Chain: source → highpass → eq → gain → analyser → output
     source.connect(highPass);
     highPass.connect(eq);
     eq.connect(gainNode);
-    gainNode.connect(analyser);
-    analyser.connect(ctx.destination);
-  }, [editItem, gain, noiseOn, eqOn]);
+    gainNode.connect(ctx.destination);
+  }, [editItem, gain, noiseOn, noiseFreq, eqOn]);
 
   useEffect(() => {
     if (screen === "edit" && editItem) {
@@ -166,12 +146,11 @@ export default function App() {
     };
   }, [screen, editItem]);
 
-  // Update audio nodes live when toggles/slider change
   useEffect(() => {
     if (editHighPassRef.current) {
-      editHighPassRef.current.frequency.value = noiseOn ? 300 : 20;
+      editHighPassRef.current.frequency.value = noiseOn ? noiseFreq : 20;
     }
-  }, [noiseOn]);
+  }, [noiseOn, noiseFreq]);
 
   useEffect(() => {
     if (editEQRef.current) {
@@ -185,7 +164,6 @@ export default function App() {
     }
   }, [gain]);
 
-  // ─── RECORDING ────────────────────────────────────────────────────────────
   const getSupportedMimeType = () => {
     const types = ["audio/mp4", "audio/aac", "audio/webm;codecs=opus", "audio/webm"];
     for (const type of types) {
@@ -261,6 +239,7 @@ export default function App() {
         setGain(0);
         setEqOn(false);
         setNoiseOn(false);
+        setNoiseFreq(100);
         setScreen("edit");
       };
       mediaRecorderRef.current.stop();
@@ -277,22 +256,53 @@ export default function App() {
     volumeRef.current = 0;
   };
 
-  // ─── EXPORT WITH PROCESSING ───────────────────────────────────────────────
+  const audioBufferToWav = (buffer) => {
+    const numChannels = buffer.numberOfChannels;
+    const sampleRate = buffer.sampleRate;
+    const bytesPerSample = 2;
+    const blockAlign = numChannels * bytesPerSample;
+    const byteRate = sampleRate * blockAlign;
+    const dataSize = buffer.length * blockAlign;
+    const arrayBuffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(arrayBuffer);
+    const writeString = (offset, str) => { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); };
+    writeString(0, "RIFF");
+    view.setUint32(4, 36 + dataSize, true);
+    writeString(8, "WAVE");
+    writeString(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, byteRate, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, 16, true);
+    writeString(36, "data");
+    view.setUint32(40, dataSize, true);
+    let offset = 44;
+    for (let i = 0; i < buffer.length; i++) {
+      for (let ch = 0; ch < numChannels; ch++) {
+        const sample = Math.max(-1, Math.min(1, buffer.getChannelData(ch)[i]));
+        view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+        offset += 2;
+      }
+    }
+    return arrayBuffer;
+  };
+
   const handleExport = async () => {
     if (!editItem?.blob) return;
     setExportMsg("Processing audio...");
-
     try {
-      const offlineCtx = new OfflineAudioContext(1, 44100 * editItem.duration || 44100 * 60, 44100);
+      const offlineCtx = new OfflineAudioContext(1, 44100 * (editItem.duration || 60), 44100);
       const arrayBuffer = await editItem.blob.arrayBuffer();
       const audioBuffer = await offlineCtx.decodeAudioData(arrayBuffer);
-
       const source = offlineCtx.createBufferSource();
       source.buffer = audioBuffer;
 
       const highPass = offlineCtx.createBiquadFilter();
       highPass.type = "highpass";
-      highPass.frequency.value = noiseOn ? 300 : 20;
+      highPass.frequency.value = noiseOn ? noiseFreq : 20;
       highPass.Q.value = 0.7;
 
       const eq = offlineCtx.createBiquadFilter();
@@ -311,8 +321,6 @@ export default function App() {
       source.start();
 
       const rendered = await offlineCtx.startRendering();
-
-      // Convert to WAV
       const wavBuffer = audioBufferToWav(rendered);
       const wavBlob = new Blob([wavBuffer], { type: "audio/wav" });
       const url = URL.createObjectURL(wavBlob);
@@ -322,7 +330,6 @@ export default function App() {
       a.click();
       setExportMsg("Saved! Open in Files app → tap Share → Save to Photos.");
     } catch {
-      // Fallback — export original
       const a = document.createElement("a");
       a.href = editItem.url;
       a.download = `thinking-out-loud-${editItem.date}.${editItem.ext || "m4a"}`.replace(/\s/g, "-");
@@ -332,46 +339,9 @@ export default function App() {
     setTimeout(() => setExportMsg(""), 5000);
   };
 
-  // WAV encoder
-  const audioBufferToWav = (buffer) => {
-    const numChannels = buffer.numberOfChannels;
-    const sampleRate = buffer.sampleRate;
-    const format = 1;
-    const bitDepth = 16;
-    const bytesPerSample = bitDepth / 8;
-    const blockAlign = numChannels * bytesPerSample;
-    const byteRate = sampleRate * blockAlign;
-    const dataSize = buffer.length * blockAlign;
-    const arrayBuffer = new ArrayBuffer(44 + dataSize);
-    const view = new DataView(arrayBuffer);
-    const writeString = (offset, str) => { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); };
-    writeString(0, "RIFF");
-    view.setUint32(4, 36 + dataSize, true);
-    writeString(8, "WAVE");
-    writeString(12, "fmt ");
-    view.setUint32(16, 16, true);
-    view.setUint16(20, format, true);
-    view.setUint16(22, numChannels, true);
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, byteRate, true);
-    view.setUint16(32, blockAlign, true);
-    view.setUint16(34, bitDepth, true);
-    writeString(36, "data");
-    view.setUint32(40, dataSize, true);
-    let offset = 44;
-    for (let i = 0; i < buffer.length; i++) {
-      for (let ch = 0; ch < numChannels; ch++) {
-        const sample = Math.max(-1, Math.min(1, buffer.getChannelData(ch)[i]));
-        view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
-        offset += 2;
-      }
-    }
-    return arrayBuffer;
-  };
-
   const handleTranslate = async (targetLang) => {
     if (!editItem?.transcript) return;
-    const fromLabel = "Hindi", toLabel = targetLang === "en" ? "English" : "Hindi";
+    const toLabel = targetLang === "en" ? "English" : "Hindi";
     setTranslating(true);
     try {
       const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -380,7 +350,7 @@ export default function App() {
         body: JSON.stringify({
           model: "claude-sonnet-4-20250514",
           max_tokens: 1000,
-          messages: [{ role: "user", content: `Translate from ${fromLabel} to ${toLabel}. Return ONLY translated text:\n\n${editItem.transcript}` }]
+          messages: [{ role: "user", content: `Translate to ${toLabel}. Return ONLY translated text:\n\n${editItem.transcript}` }]
         })
       });
       const data = await response.json();
@@ -481,34 +451,35 @@ export default function App() {
 
       <div style={{ flex: 1, padding: "24px", display: "flex", flexDirection: "column", gap: 24, overflowY: "auto" }}>
 
-        {/* Audio player — processed live */}
-        <audio
-          ref={editAudioElRef}
-          src={editItem.url}
-          controls
-          onPlay={() => {
-            if (editAudioCtxRef.current?.state === "suspended") editAudioCtxRef.current.resume();
-          }}
-          style={{ width: "100%", filter: "invert(1)", borderRadius: 8 }}
-        />
+        <audio ref={editAudioElRef} src={editItem.url} controls
+          onPlay={() => { if (editAudioCtxRef.current?.state === "suspended") editAudioCtxRef.current.resume(); }}
+          style={{ width: "100%", filter: "invert(1)", borderRadius: 8 }} />
 
         {/* Gain */}
         <div>
           <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
             <div style={{ fontSize: 11, letterSpacing: "0.2em", color: "rgba(255,255,255,0.35)", textTransform: "uppercase" }}>Volume Gain</div>
-            <div style={{ fontSize: 12, color: gain > 0 ? "#fff" : gain < 0 ? "rgba(255,255,255,0.4)" : "rgba(255,255,255,0.3)" }}>{gain > 0 ? `+${gain}` : gain} dB</div>
+            <div style={{ fontSize: 12, color: "rgba(255,255,255,0.6)" }}>{gain > 0 ? `+${gain}` : gain} dB</div>
           </div>
-          <input type="range" min="-10" max="10" step="1" value={gain} onChange={e => setGain(Number(e.target.value))}
-            style={{ width: "100%", accentColor: "#fff", cursor: "pointer" }} />
+          <input type="range" min="-10" max="10" step="1" value={gain} onChange={e => setGain(Number(e.target.value))} style={{ width: "100%", accentColor: "#fff", cursor: "pointer" }} />
           <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "rgba(255,255,255,0.2)", marginTop: 4 }}>
             <span>-10</span><span>0</span><span>+10</span>
           </div>
         </div>
 
-        {/* EQ + Noise toggles */}
+        {/* Toggles */}
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           <Toggle on={eqOn} onToggle={() => setEqOn(p => !p)} label="Voice Clarity" sub="Boost 1kHz–4kHz voice range" />
-          <Toggle on={noiseOn} onToggle={() => setNoiseOn(p => !p)} label="Noise Filter" sub="Cut wind & rumble below 300Hz" />
+          <Toggle on={noiseOn} onToggle={() => setNoiseOn(p => !p)} label="Noise Filter" sub={`High-pass at ${noiseFreq}Hz`} />
+          {noiseOn && (
+            <div style={{ display: "flex", gap: 8 }}>
+              {[80, 100, 120, 150].map(freq => (
+                <button key={freq} onClick={() => setNoiseFreq(freq)} style={{ flex: 1, padding: "10px 0", borderRadius: 8, border: noiseFreq === freq ? "1px solid #fff" : "1px solid rgba(255,255,255,0.15)", background: noiseFreq === freq ? "#fff" : "transparent", color: noiseFreq === freq ? "#000" : "rgba(255,255,255,0.5)", fontSize: 13, fontFamily: "inherit", cursor: "pointer" }}>
+                  {freq}Hz
+                </button>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Transcript */}
@@ -555,7 +526,7 @@ export default function App() {
       <div style={{ padding: "8px 24px" }}>
         {recordings.length === 0 && <div style={{ textAlign: "center", color: "rgba(255,255,255,0.25)", padding: "60px 0", fontSize: 15, fontStyle: "italic" }}>No recordings yet</div>}
         {recordings.map(rec => (
-          <div key={rec.id} onClick={() => { setEditItem(rec); setGain(0); setEqOn(false); setNoiseOn(false); setScreen("edit"); }}
+          <div key={rec.id} onClick={() => { setEditItem(rec); setGain(0); setEqOn(false); setNoiseOn(false); setNoiseFreq(100); setScreen("edit"); }}
             style={{ padding: "18px 0", borderBottom: "1px solid rgba(255,255,255,0.07)", cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontSize: 16, marginBottom: 3, fontStyle: "italic" }}>{rec.date}</div>
